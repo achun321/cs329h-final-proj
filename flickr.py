@@ -298,6 +298,23 @@ def calculate_average_cosine_similarity(G):
         return 0.0  # Avoid division by zero if no edges
     return sum(edge_weights) / len(edge_weights)
 
+def compute_query_similarity(original_embedding, top_k_embeddings):
+    """
+    Compute the average cosine similarity between the original query embedding
+    and the embeddings of the top-k nodes after the re-query.
+
+    Args:
+        original_embedding: The embedding of the original query.
+        top_k_embeddings: Embeddings of the top-k nodes after re-query.
+
+    Returns:
+        average_similarity: The average cosine similarity.
+    """
+    similarities = [
+        np.dot(original_embedding, embedding) for embedding in top_k_embeddings
+    ]
+    return sum(similarities) / len(similarities)
+
 
 if __name__ == "__main__":
     subset_size = 1000
@@ -319,10 +336,19 @@ if __name__ == "__main__":
 
         # Compute embeddings
         image_embeddings = compute_image_embeddings(ds, model, processor)
+        np.save("flickr30k_image_embeddings.npy", image_embeddings)
         index = create_or_load_faiss_index(image_embeddings, faiss_index_path)
     else:
         # Load FAISS index directly
         index = create_or_load_faiss_index(None, faiss_index_path)
+        # Load precomputed embeddings
+        if os.path.exists("flickr30k_image_embeddings.npy"):
+            image_embeddings = np.load("flickr30k_image_embeddings.npy")
+            print("Loaded precomputed image embeddings.")
+        else:
+            raise FileNotFoundError(
+                "Precomputed image embeddings not found. Ensure 'flickr30k_image_embeddings.npy' exists."
+        )
 
     # Perform the initial query
     query = "Peace"
@@ -330,16 +356,32 @@ if __name__ == "__main__":
     model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
     processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
 
-    # Initialize graph
+    # Get original query embedding
+    inputs = processor(text=query, return_tensors="pt").to(device)
+    with torch.no_grad():
+        original_query_embedding = model.get_text_features(**inputs)
+        original_query_embedding = original_query_embedding / original_query_embedding.norm(dim=-1, keepdim=True)
+    original_query_embedding = original_query_embedding.cpu().numpy().astype("float32")
+
+    # Perform the initial query and graph creation
     G = query_faiss_index(query, model, processor, index, ds, k=k)
 
     # Save the initial graph
     save_graph_image(G, save_path="retrieved_images/retrieved_graph_iteration_0.png")
 
-    # Log average cosine similarity
-    average_similarities = []
+    # Compute baseline similarity: Original k images to original query
+    original_k_indices = list(G.nodes)[:k]  # First k nodes from initial query
+    original_k_embeddings = [image_embeddings[idx] for idx in original_k_indices]
+    baseline_similarity = compute_query_similarity(original_query_embedding[0], original_k_embeddings)
+    print(f"Baseline Similarity (Original k Images to Original Query): {baseline_similarity:.4f}")
+
+    # Log average similarities
+    avg_cos_similarities = []
+    query_to_original_similarities = []
+    
+    # 0th iteration cos sim
     avg_similarity = calculate_average_cosine_similarity(G)
-    average_similarities.append(avg_similarity)
+    avg_cos_similarities.append(avg_similarity)
     print(f"Iteration 0: Average Cosine Similarity = {avg_similarity:.4f}")
 
     # Start the requery loop
@@ -349,22 +391,13 @@ if __name__ == "__main__":
         # Integrate human feedback into the graph
         integrate_human_feedback(G, feedback_path)
 
-        # Save the graph after feedback
-        save_graph_image(G, save_path=f"retrieved_images/retrieved_graph_iteration_{iteration}_post_feedback.png")
-
-        # Calculate and log average cosine similarity
-        avg_similarity = calculate_average_cosine_similarity(G)
-        average_similarities.append(avg_similarity)
-        print(f"Iteration {iteration}: Average Cosine Similarity = {avg_similarity:.4f}")
-
         # Find top-j closest nodes based on the updated graph
         top_j_nodes = find_top_j_closest_nodes(G, j=j)
         top_j_captions = [ds[int(node)]["caption"][0] for node in top_j_nodes]
         print(f"Top-{j} captions for iteration {iteration}: {top_j_captions}")
-        raise Exception("TEST")
 
         # Generate a consolidated caption using ChatGPT
-        new_caption = "A calm and so"
+        new_caption = "The scenes capture tranquil moments of connection, with people and children enjoying nighttime views by the water and gathering outdoors under the evening sky."
         print(f"Consolidated Caption for iteration {iteration}: {new_caption}")
 
         # Perform a re-query with the new caption
@@ -373,13 +406,19 @@ if __name__ == "__main__":
         # Save the updated graph
         save_graph_image(G, save_path=f"retrieved_images/retrieved_graph_iteration_{iteration}_new_query.png")
 
-    # Log overall average cosine similarities
-    print("\n--- Average Cosine Similarities Over Iterations ---")
-    for i, similarity in enumerate(average_similarities):
-        print(f"Iteration {i}: {similarity:.4f}")
+        # Calculate average cosine similarity of the updated graph
+        avg_similarity = calculate_average_cosine_similarity(G)
+        avg_cos_similarities.append(avg_similarity)
+        print(f"Iteration {iteration}: Average Cosine Similarity in Graph = {avg_similarity:.4f}")
 
+        # Compute similarity between the original query and re-queried nodes
+        top_k_indices = list(G.nodes)[:k]  # First k nodes from updated graph
+        top_k_embeddings = [image_embeddings[idx] for idx in top_k_indices]
+        query_similarity = compute_query_similarity(original_query_embedding[0], top_k_embeddings)
+        query_to_original_similarities.append(query_similarity)
+        print(f"Iteration {iteration}: Similarity to Original Query = {query_similarity:.4f}")
 
-
-
-
-
+    # Log all results
+    print("\n--- Summary of Cosine Similarities ---")
+    for i, (avg_sim, query_sim) in enumerate(zip(avg_cos_similarities, query_to_original_similarities), 1):
+        print(f"Iteration {i}: Avg Cosine Similarity = {avg_sim:.4f}, Query Similarity = {query_sim:.4f}")
