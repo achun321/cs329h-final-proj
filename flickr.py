@@ -6,27 +6,25 @@ import numpy as np
 import faiss
 from tqdm import tqdm
 from PIL import Image
+import matplotlib.pyplot as s plt
+import networkx as nx
+import json
 
-# Load the Flickr30k dataset
-ds = load_dataset("nlphuji/flickr30k", split="test")
 
-# Use a subset of the dataset (e.g., first 1000 examples)
-subset_size = 1000
-ds = ds.select(range(subset_size))
 
-# Check if FAISS index exists
-faiss_index_path = "flickr30k_image_index.faiss"
-if os.path.exists(faiss_index_path):
-    # Load FAISS index directly
-    index = faiss.read_index(faiss_index_path)
-    print(f"Loaded FAISS index with {index.ntotal} vectors.")
-else:
-    # Compute embeddings and create FAISS index
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
-    processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
 
-    batch_size = 32
+def load_dataset_subset(subset_size=1000):
+    """
+    Load the Flickr30k dataset and select a subset of it.
+    """
+    ds = load_dataset("nlphuji/flickr30k", split="test")
+    return ds.select(range(subset_size))
+
+
+def compute_image_embeddings(ds, model, processor, batch_size=32):
+    """
+    Compute image embeddings for the given dataset.
+    """
     image_embeddings = []
     images = []
 
@@ -34,7 +32,7 @@ else:
         images.append(example["image"])  # Collect images for embedding
 
         if len(images) == batch_size:
-            # Compute image embeddings for the batch
+            # Process a batch of images
             inputs = processor(images=images, return_tensors="pt").to(device)
             with torch.no_grad():
                 embeds = model.get_image_features(**inputs)
@@ -50,36 +48,160 @@ else:
             embeds = embeds / embeds.norm(dim=-1, keepdim=True)
             image_embeddings.append(embeds.cpu().numpy())
 
-    # Concatenate embeddings and create FAISS index
-    image_embeddings = np.concatenate(image_embeddings, axis=0).astype("float32")
-    index = faiss.IndexFlatIP(image_embeddings.shape[1])  # Inner Product for cosine similarity
-    index.add(image_embeddings)
-    faiss.write_index(index, faiss_index_path)
-    print(f"Created and saved FAISS index with {index.ntotal} vectors.")
+    return np.concatenate(image_embeddings, axis=0).astype("float32")
 
-# Perform a query with text embeddings
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
-processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
 
-query = "A group of people playing soccer"
-inputs = processor(text=query, return_tensors="pt").to(device)
-with torch.no_grad():
-    query_embedding = model.get_text_features(**inputs)
-    query_embedding = query_embedding / query_embedding.norm(dim=-1, keepdim=True)
-query_embedding = query_embedding.cpu().numpy().astype("float32")
+def create_or_load_faiss_index(embeddings, faiss_index_path):
+    """
+    Create a FAISS index with the given embeddings or load an existing index.
+    """
+    if os.path.exists(faiss_index_path):
+        index = faiss.read_index(faiss_index_path)
+        print(f"Loaded FAISS index with {index.ntotal} vectors.")
+    else:
+        index = faiss.IndexFlatIP(embeddings.shape[1])  # Inner Product for cosine similarity
+        index.add(embeddings)
+        faiss.write_index(index, faiss_index_path)
+        print(f"Created and saved FAISS index with {index.ntotal} vectors.")
+    return index
 
-k = 5
-distances, indices = index.search(query_embedding, k)
 
-for i, idx in enumerate(indices[0]):
-    idx = int(idx)  
-    example = ds[idx]  
-    image = example["image"]  
-    caption = example["caption"]  
+def create_similarity_graph(indices, embeddings):
+    """
+    Create a graph for the retrieved nodes based on their cosine similarity.
 
-    retrieved_image_path = f"retrieved_images/retrieved_{i+1}.jpg"
-    image.save(retrieved_image_path, "JPEG")  
-    print(f"Rank {i+1}: {caption[0]} (Saved to {retrieved_image_path})")
+    Args:
+        indices: List of indices of the top-k retrieved nodes.
+        embeddings: Corresponding embeddings of the retrieved nodes.
+    
+    Returns:
+        G: A NetworkX graph where nodes are the retrieved indices and edges
+           are weighted by their cosine similarity.
+    """
+    G = nx.Graph()
 
+    # Add nodes with default weight
+    for idx in indices:
+        G.add_node(idx, weight=1.0)
+
+    # Compute cosine similarity for edges
+    num_nodes = len(indices)
+    for i in range(num_nodes):
+        for j in range(i + 1, num_nodes):  # Avoid redundant pairs and self-loops
+            similarity = np.dot(embeddings[i], embeddings[j])
+            G.add_edge(indices[i], indices[j], weight=similarity)
+
+    return G
+
+
+def query_faiss_index(query, model, processor, index, ds, k=5):
+    """
+    Perform a query using the FAISS index and retrieve the top-k results.
+    Also create a similarity graph for the retrieved results.
+    """
+    inputs = processor(text=query, return_tensors="pt").to(device)
+    with torch.no_grad():
+        query_embedding = model.get_text_features(**inputs)
+        query_embedding = query_embedding / query_embedding.norm(dim=-1, keepdim=True)
+    query_embedding = query_embedding.cpu().numpy().astype("float32")
+
+    # Search the FAISS index
+    distances, indices = index.search(query_embedding, k)
+
+    # Retrieve embeddings for the top-k indices
+    top_k_embeddings = []
+    for idx in indices[0]:
+        top_k_embeddings.append(index.reconstruct(int(idx)))
+    top_k_embeddings = np.array(top_k_embeddings)
+
+    # Create a similarity graph
+    G = create_similarity_graph(indices[0], top_k_embeddings)
+    print(f"Created a graph with {len(G.nodes)} nodes and {len(G.edges)} edges.")
+
+    # Retrieve and display results
+    for i, idx in enumerate(indices[0]):
+        idx = int(idx)
+        example = ds[idx]
+        image = example["image"]
+        caption = example["caption"]
+
+        # Save the retrieved image
+        retrieved_image_path = f"retrieved_images/retrieved_{i+1}.jpg"
+        os.makedirs("retrieved_images", exist_ok=True)
+        image.save(retrieved_image_path, "JPEG")
+
+        print(f"Rank {i+1}: {caption[0]} (Saved to {retrieved_image_path})")
+
+    return G  # Return the graph
+
+def save_graph_image(G, save_path="retrieved_images/retrieved_graph.png", title="Graph Visualization"):
+    """
+    Save the graph as an image to the specified path.
+    
+    Args:
+        G: NetworkX graph to visualize.
+        save_path: Path to save the graph image.
+        title: Title of the graph visualization.
+    """
+    import matplotlib.pyplot as plt
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)  # Ensure directory exists
+
+    # Draw the graph
+    pos = nx.spring_layout(G, seed=42)  # Spring layout for better aesthetics
+    plt.figure(figsize=(10, 8))
+    
+    # Draw nodes and edges with weights
+    nx.draw(
+        G,
+        pos,
+        with_labels=True,
+        node_size=700,
+        node_color="skyblue",
+        edge_color="gray",
+        font_weight="bold"
+    )
+    
+    # Add edge weights
+    edge_labels = nx.get_edge_attributes(G, 'weight')
+    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels)
+    
+    # Title and save
+    plt.title(title, fontsize=15)
+    plt.savefig(save_path, format="png")
+    plt.close()  # Close the figure to avoid display-related issues
+    print(f"Graph saved to {save_path}")
+
+
+
+
+if __name__ == "__main__":
+    subset_size = 1000
+    faiss_index_path = "flickr30k_image_index.faiss"
+
+    # Load dataset
+    ds = load_dataset_subset(subset_size=subset_size)
+
+    # Check if FAISS index exists, else compute embeddings and create it
+    if not os.path.exists(faiss_index_path):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
+        processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
+
+        # Compute embeddings
+        image_embeddings = compute_image_embeddings(ds, model, processor)
+        index = create_or_load_faiss_index(image_embeddings, faiss_index_path)
+    else:
+        # Load FAISS index directly
+        index = create_or_load_faiss_index(None, faiss_index_path)
+
+    # Perform a query
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
+    processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
+    query = "Community"
+    
+    # Query and create a graph for the top-k results
+    G = query_faiss_index(query, model, processor, index, ds, k=5)
+
+    save_graph_image(G, save_path="retrieved_images/retrieved_graph.png", title="Retrieved Graph for Query: 'Community'")
 
