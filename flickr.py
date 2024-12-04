@@ -9,6 +9,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import networkx as nx
 import json
+import openai
 
 
 
@@ -191,6 +192,62 @@ def normalize_graph_weights(G, node_range=(0, 1), edge_range=(0, 1)):
     for u, v in G.edges:
         weight = G[u][v]["weight"]
         G[u][v]["weight"] = max(edge_min, min(edge_max, weight))
+        
+def find_top_j_closest_nodes(G, j=3):
+    """
+    Find the top-j closest nodes in the graph based on edge weights.
+    
+    Args:
+        G: NetworkX graph.
+        j: Number of nodes to retrieve.
+
+    Returns:
+        top_j_nodes: List of node indices for the top-j closest nodes.
+    """
+    if j > len(G.nodes):
+        raise ValueError("j cannot be greater than the number of nodes in the graph.")
+
+    # Compute closeness scores
+    closeness_scores = []
+    for node in G.nodes:
+        total_weight = sum(G[node][neighbor]["weight"] for neighbor in G.neighbors(node))
+        closeness_scores.append((node, total_weight))
+    
+    # Sort by closeness and select top-j
+    closeness_scores.sort(key=lambda x: x[1], reverse=True)
+    top_j_nodes = [node for node, _ in closeness_scores[:j]]
+    return top_j_nodes
+
+def generate_consolidated_caption(captions, api_key):
+    """
+    Use ChatGPT to consolidate multiple captions into a single caption.
+
+    Args:
+        captions: List of captions to consolidate.
+        api_key: OpenAI API key.
+
+    Returns:
+        consolidated_caption: A single consolidated caption.
+    """
+    openai.api_key = api_key
+
+    # Prepare prompt
+    prompt = (
+        "The following are captions of images related to a query. "
+        "Please consolidate them into a single caption that captures their essence:\n\n"
+    )
+    prompt += "\n".join(f"- {caption}" for caption in captions)
+    prompt += "\n\nConsolidated Caption:"
+
+    # Call ChatGPT
+    response = openai.ChatCompletion.create(
+        model="gpt-4",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    consolidated_caption = response["choices"][0]["message"]["content"].strip()
+    return consolidated_caption
+
+
 
 
 def integrate_human_feedback(G, feedback_path, scaling_factor=2.0):
@@ -226,12 +283,30 @@ def integrate_human_feedback(G, feedback_path, scaling_factor=2.0):
     # Normalize node and edge weights
     normalize_graph_weights(G)
 
+def calculate_average_cosine_similarity(G):
+    """
+    Calculate the average cosine similarity (edge weight) in the graph.
+
+    Args:
+        G: NetworkX graph.
+
+    Returns:
+        average_similarity: The average edge weight in the graph.
+    """
+    edge_weights = [G[u][v]["weight"] for u, v in G.edges]
+    if not edge_weights:
+        return 0.0  # Avoid division by zero if no edges
+    return sum(edge_weights) / len(edge_weights)
 
 
 if __name__ == "__main__":
     subset_size = 1000
     faiss_index_path = "flickr30k_image_index.faiss"
     feedback_path = "feedback.json"
+    api_key = "your-openai-api-key"  # Replace with your OpenAI API key
+    max_iterations = 1  # Number of requery cycles
+    k = 10  # Number of top results to retrieve
+    j = 3  # Number of top nodes to consolidate
 
     # Load dataset
     ds = load_dataset_subset(subset_size=subset_size)
@@ -249,22 +324,62 @@ if __name__ == "__main__":
         # Load FAISS index directly
         index = create_or_load_faiss_index(None, faiss_index_path)
 
-    # Perform a query
+    # Perform the initial query
+    query = "Peace"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
     processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
-    query = "Peace"
-    
-    # Query and create a graph for the top-k results
-    G = query_faiss_index(query, model, processor, index, ds, k=5)
 
-    # Save the graph before feedback
-    save_graph_image(G, save_path="retrieved_images/retrieved_graph_pre_feedback.png")
+    # Initialize graph
+    G = query_faiss_index(query, model, processor, index, ds, k=k)
 
-    # Integrate human feedback
-    integrate_human_feedback(G, feedback_path)
+    # Save the initial graph
+    save_graph_image(G, save_path="retrieved_images/retrieved_graph_iteration_0.png")
 
-    # Save the graph after feedback
-    save_graph_image(G, save_path="retrieved_images/retrieved_graph_post_feedback.png")
+    # Log average cosine similarity
+    average_similarities = []
+    avg_similarity = calculate_average_cosine_similarity(G)
+    average_similarities.append(avg_similarity)
+    print(f"Iteration 0: Average Cosine Similarity = {avg_similarity:.4f}")
+
+    # Start the requery loop
+    for iteration in range(1, max_iterations + 1):
+        print(f"\n--- Iteration {iteration} ---\n")
+
+        # Integrate human feedback into the graph
+        integrate_human_feedback(G, feedback_path)
+
+        # Save the graph after feedback
+        save_graph_image(G, save_path=f"retrieved_images/retrieved_graph_iteration_{iteration}_post_feedback.png")
+
+        # Calculate and log average cosine similarity
+        avg_similarity = calculate_average_cosine_similarity(G)
+        average_similarities.append(avg_similarity)
+        print(f"Iteration {iteration}: Average Cosine Similarity = {avg_similarity:.4f}")
+
+        # Find top-j closest nodes based on the updated graph
+        top_j_nodes = find_top_j_closest_nodes(G, j=j)
+        top_j_captions = [ds[int(node)]["caption"][0] for node in top_j_nodes]
+        print(f"Top-{j} captions for iteration {iteration}: {top_j_captions}")
+        raise Exception("TEST")
+
+        # Generate a consolidated caption using ChatGPT
+        new_caption = "A calm and so"
+        print(f"Consolidated Caption for iteration {iteration}: {new_caption}")
+
+        # Perform a re-query with the new caption
+        G = query_faiss_index(new_caption, model, processor, index, ds, k=k)
+
+        # Save the updated graph
+        save_graph_image(G, save_path=f"retrieved_images/retrieved_graph_iteration_{iteration}_new_query.png")
+
+    # Log overall average cosine similarities
+    print("\n--- Average Cosine Similarities Over Iterations ---")
+    for i, similarity in enumerate(average_similarities):
+        print(f"Iteration {i}: {similarity:.4f}")
+
+
+
+
 
 
