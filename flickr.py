@@ -4,7 +4,6 @@ import torch
 from transformers import CLIPProcessor, CLIPModel
 import numpy as np
 import faiss
-from sklearn.preprocessing import normalize
 from tqdm import tqdm
 from PIL import Image
 
@@ -15,112 +14,72 @@ ds = load_dataset("nlphuji/flickr30k", split="test")
 subset_size = 1000
 ds = ds.select(range(subset_size))
 
-# Load CLIP model and processor, and move the model to GPU
+# Check if FAISS index exists
+faiss_index_path = "flickr30k_image_index.faiss"
+if os.path.exists(faiss_index_path):
+    # Load FAISS index directly
+    index = faiss.read_index(faiss_index_path)
+    print(f"Loaded FAISS index with {index.ntotal} vectors.")
+else:
+    # Compute embeddings and create FAISS index
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
+    processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
+
+    batch_size = 32
+    image_embeddings = []
+    images = []
+
+    for i, example in enumerate(tqdm(ds)):
+        images.append(example["image"])  # Collect images for embedding
+
+        if len(images) == batch_size:
+            # Compute image embeddings for the batch
+            inputs = processor(images=images, return_tensors="pt").to(device)
+            with torch.no_grad():
+                embeds = model.get_image_features(**inputs)
+                embeds = embeds / embeds.norm(dim=-1, keepdim=True)
+                image_embeddings.append(embeds.cpu().numpy())
+            images = []
+
+    # Process remaining images
+    if images:
+        inputs = processor(images=images, return_tensors="pt").to(device)
+        with torch.no_grad():
+            embeds = model.get_image_features(**inputs)
+            embeds = embeds / embeds.norm(dim=-1, keepdim=True)
+            image_embeddings.append(embeds.cpu().numpy())
+
+    # Concatenate embeddings and create FAISS index
+    image_embeddings = np.concatenate(image_embeddings, axis=0).astype("float32")
+    index = faiss.IndexFlatIP(image_embeddings.shape[1])  # Inner Product for cosine similarity
+    index.add(image_embeddings)
+    faiss.write_index(index, faiss_index_path)
+    print(f"Created and saved FAISS index with {index.ntotal} vectors.")
+
+# Perform a query with text embeddings
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
 processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
 
-# Parameters
-batch_size = 32  # Adjust based on available GPU memory
-image_embeddings = []
-text_embeddings = []
-
-# Directories for saving results
-image_folder = "flickr30k_images"
-retrieved_images_folder = "retrieved_images"
-os.makedirs(image_folder, exist_ok=True)
-os.makedirs(retrieved_images_folder, exist_ok=True)
-
-# Batch processing
-images = []
-captions = []
-
-for i, example in enumerate(tqdm(ds)):
-    # Save image to disk
-    image = example["image"]
-    image_path = os.path.join(image_folder, f"{i}.jpg")
-    image.save(image_path, "JPEG")  # Save image as JPEG
-
-    # Collect images and first captions for batching
-    images.append(image)
-    captions.append(example["caption"][0])  # First caption in the list
-
-    # Process the batch if it reaches the batch_size
-    if len(images) == batch_size:
-        # Process image embeddings
-        image_inputs = processor(images=images, return_tensors="pt", padding=True).to(device)
-        with torch.no_grad():
-            image_embeds = model.get_image_features(**image_inputs)  # Image embeddings
-            image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)  # Normalize
-            image_embeddings.append(image_embeds.cpu().numpy())  # Move to CPU
-
-        # Process text embeddings
-        text_inputs = processor(text=captions, return_tensors="pt", padding=True).to(device)
-        with torch.no_grad():
-            text_embeds = model.get_text_features(**text_inputs)  # Text embeddings
-            text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)  # Normalize
-            text_embeddings.append(text_embeds.cpu().numpy())  # Move to CPU
-
-        # Clear batches
-        images = []
-        captions = []
-
-# Process any remaining images and captions
-if images:
-    # Process remaining image embeddings
-    image_inputs = processor(images=images, return_tensors="pt", padding=True).to(device)
-    with torch.no_grad():
-        image_embeds = model.get_image_features(**image_inputs)
-        image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
-        image_embeddings.append(image_embeds.cpu().numpy())
-
-    # Process remaining text embeddings
-    text_inputs = processor(text=captions, return_tensors="pt", padding=True).to(device)
-    with torch.no_grad():
-        text_embeds = model.get_text_features(**text_inputs)
-        text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
-        text_embeddings.append(text_embeds.cpu().numpy())
-
-# Concatenate all batches into single arrays
-image_embeddings = np.concatenate(image_embeddings, axis=0)
-text_embeddings = np.concatenate(text_embeddings, axis=0)
-
-print(f"Image Embeddings Shape: {image_embeddings.shape}")
-print(f"Text Embeddings Shape: {text_embeddings.shape}")
-
-# Normalize embeddings for FAISS
-normalized_image_embeddings = normalize(image_embeddings, axis=1).astype("float32")
-
-# Create FAISS index
-dimension = normalized_image_embeddings.shape[1]  # Dimensionality of embeddings (1024 for ViT-L/14)
-index = faiss.IndexFlatIP(dimension)  # Inner Product (cosine similarity with normalized embeddings)
-index.add(normalized_image_embeddings)  # Add image embeddings to FAISS index
-print(f"FAISS index contains {index.ntotal} vectors.")
-
-# Perform a query with text embeddings
-query = "A group of people playing soccer"  # Example query
-query_inputs = processor(text=query, return_tensors="pt", padding=True).to(device)
+query = "A group of people playing soccer"
+inputs = processor(text=query, return_tensors="pt").to(device)
 with torch.no_grad():
-    query_embedding = model.get_text_features(**query_inputs)
+    query_embedding = model.get_text_features(**inputs)
     query_embedding = query_embedding / query_embedding.norm(dim=-1, keepdim=True)
-query_embedding = query_embedding.cpu().numpy().astype("float32")  # Convert to NumPy for FAISS
+query_embedding = query_embedding.cpu().numpy().astype("float32")
 
-# Search the FAISS index
-k = 5  # Number of nearest neighbors to retrieve
+k = 5
 distances, indices = index.search(query_embedding, k)
 
-# Save retrieved images to a folder
 for i, idx in enumerate(indices[0]):
-    # Retrieve dataset example
-    idx = int(idx)
-    image_path = os.path.join(image_folder, f"{idx}.jpg")  # Get saved image
-    retrieved_image_path = os.path.join(retrieved_images_folder, f"retrieved_{i+1}.jpg")  # Save retrieved image
-    caption = ds[idx]["caption"]  # Retrieve captions for the image
+    idx = int(idx)  
+    example = ds[idx]  
+    image = example["image"]  
+    caption = example["caption"]  
 
-    # Copy image to retrieved_images folder
-    with Image.open(image_path) as img:
-        img.save(retrieved_image_path)
+    retrieved_image_path = f"retrieved_images/retrieved_{i+1}.jpg"
+    image.save(retrieved_image_path, "JPEG")  
+    print(f"Rank {i+1}: {caption[0]} (Saved to {retrieved_image_path})")
 
-    # Print the rank, caption, and path
-    print(f"Rank {i+1}: {caption[0]}")
-    print(f"Saved to: {retrieved_image_path}")
+
