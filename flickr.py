@@ -6,7 +6,7 @@ import numpy as np
 import faiss
 from tqdm import tqdm
 from PIL import Image
-import matplotlib.pyplot as s plt
+import matplotlib.pyplot as plt
 import networkx as nx
 import json
 
@@ -126,7 +126,7 @@ def query_faiss_index(query, model, processor, index, ds, k=5):
         caption = example["caption"]
 
         # Save the retrieved image
-        retrieved_image_path = f"retrieved_images/retrieved_{i+1}.jpg"
+        retrieved_image_path = f"retrieved_images/retrieved_{idx}.jpg"
         os.makedirs("retrieved_images", exist_ok=True)
         image.save(retrieved_image_path, "JPEG")
 
@@ -170,13 +170,68 @@ def save_graph_image(G, save_path="retrieved_images/retrieved_graph.png", title=
     plt.savefig(save_path, format="png")
     plt.close()  # Close the figure to avoid display-related issues
     print(f"Graph saved to {save_path}")
+    
+def normalize_graph_weights(G, node_range=(0, 1), edge_range=(0, 1)):
+    """
+    Normalize node and edge weights to lie within specified ranges.
 
+    Args:
+        G: NetworkX graph.
+        node_range: Tuple specifying min and max for node weights.
+        edge_range: Tuple specifying min and max for edge weights.
+    """
+    # Normalize node weights
+    node_min, node_max = node_range
+    for node in G.nodes:
+        weight = G.nodes[node]["weight"]
+        G.nodes[node]["weight"] = max(node_min, min(node_max, weight))
+
+    # Normalize edge weights
+    edge_min, edge_max = edge_range
+    for u, v in G.edges:
+        weight = G[u][v]["weight"]
+        G[u][v]["weight"] = max(edge_min, min(edge_max, weight))
+
+
+def integrate_human_feedback(G, feedback_path, scaling_factor=2.0):
+    """
+    Integrate human feedback into the graph.
+
+    Args:
+        G: NetworkX graph.
+        feedback_path: Path to the JSON file containing human feedback.
+        scaling_factor: Factor to amplify the impact of feedback on node weights.
+    """
+    # Load feedback
+    with open(feedback_path, "r") as f:
+        feedback = json.load(f)
+
+    # Update nodes based on feedback
+    for row in feedback:
+        img_num = row["img_num"]  # Node index
+        score = row["score"]      # Relevance score
+        
+        if img_num in G.nodes:
+            # Adjust node weight
+            G.nodes[img_num]["weight"] += score * scaling_factor
+
+            # Propagate feedback to neighbors
+            for neighbor in G.neighbors(img_num):
+                edge_weight = G[img_num][neighbor]["weight"]
+                # Adjust edge weight based on feedback and similarity
+                G[img_num][neighbor]["weight"] += score * edge_weight * scaling_factor
+        else:
+            print(f"Node {img_num} not found in graph. Skipping.")
+    
+    # Normalize node and edge weights
+    normalize_graph_weights(G)
 
 
 
 if __name__ == "__main__":
     subset_size = 1000
     faiss_index_path = "flickr30k_image_index.faiss"
+    feedback_path = "feedback.json"
 
     # Load dataset
     ds = load_dataset_subset(subset_size=subset_size)
@@ -198,10 +253,18 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
     processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
-    query = "Community"
+    query = "Peace"
     
     # Query and create a graph for the top-k results
     G = query_faiss_index(query, model, processor, index, ds, k=5)
 
-    save_graph_image(G, save_path="retrieved_images/retrieved_graph.png", title="Retrieved Graph for Query: 'Community'")
+    # Save the graph before feedback
+    save_graph_image(G, save_path="retrieved_images/retrieved_graph_pre_feedback.png")
+
+    # Integrate human feedback
+    integrate_human_feedback(G, feedback_path)
+
+    # Save the graph after feedback
+    save_graph_image(G, save_path="retrieved_images/retrieved_graph_post_feedback.png")
+
 
