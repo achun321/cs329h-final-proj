@@ -67,38 +67,48 @@ def create_or_load_faiss_index(embeddings, faiss_index_path):
     return index
 
 
-def create_similarity_graph(indices, embeddings):
+def create_query_similarity_graph(indices, embeddings, query_embedding):
     """
-    Create a graph for the retrieved nodes based on their cosine similarity.
+    Create a graph for the retrieved nodes based on their similarity to the query.
 
     Args:
         indices: List of indices of the top-k retrieved nodes.
         embeddings: Corresponding embeddings of the retrieved nodes.
-    
+        query_embedding: The embedding of the original query.
+
     Returns:
-        G: A NetworkX graph where nodes are the retrieved indices and edges
-           are weighted by their cosine similarity.
+        G: A NetworkX graph where nodes represent retrieved images and edges connect
+           them to the query node, weighted by cosine similarity to the query.
     """
     G = nx.Graph()
 
-    # Add nodes with default weight
-    for idx in indices:
-        G.add_node(idx, weight=1.0)
+    # Add a central "query" node
+    G.add_node("query", weight=1.0)
 
-    # Compute cosine similarity for edges
-    num_nodes = len(indices)
-    for i in range(num_nodes):
-        for j in range(i + 1, num_nodes):  # Avoid redundant pairs and self-loops
-            similarity = np.dot(embeddings[i], embeddings[j])
-            G.add_edge(indices[i], indices[j], weight=similarity)
+    # Add image nodes and their similarity to the query
+    for idx, embedding in zip(indices, embeddings):
+        similarity = np.dot(embedding, query_embedding)
+        G.add_node(idx, weight=1.0)  # Initialize node weights
+        G.add_edge(idx, "query", weight=similarity)  # Edge weight is the similarity to the query
 
     return G
 
 
-def query_faiss_index(query, model, processor, index, ds, k=5):
+
+def query_faiss_index_with_query_graph(query, model, processor, index, ds, k=5):
     """
-    Perform a query using the FAISS index and retrieve the top-k results.
-    Also create a similarity graph for the retrieved results.
+    Perform a query using the FAISS index and create a graph of similarities to the query.
+
+    Args:
+        query: The query text.
+        model: The CLIP model.
+        processor: The CLIP processor.
+        index: The FAISS index.
+        ds: The dataset.
+        k: Number of top results to retrieve.
+
+    Returns:
+        G: A NetworkX graph where nodes are images and edges connect to the query.
     """
     inputs = processor(text=query, return_tensors="pt").to(device)
     with torch.no_grad():
@@ -110,13 +120,11 @@ def query_faiss_index(query, model, processor, index, ds, k=5):
     distances, indices = index.search(query_embedding, k)
 
     # Retrieve embeddings for the top-k indices
-    top_k_embeddings = []
-    for idx in indices[0]:
-        top_k_embeddings.append(index.reconstruct(int(idx)))
+    top_k_embeddings = [index.reconstruct(int(idx)) for idx in indices[0]]
     top_k_embeddings = np.array(top_k_embeddings)
 
-    # Create a similarity graph
-    G = create_similarity_graph(indices[0], top_k_embeddings)
+    # Create a graph of similarities to the query
+    G = create_query_similarity_graph(indices[0], top_k_embeddings, query_embedding[0])
     print(f"Created a graph with {len(G.nodes)} nodes and {len(G.edges)} edges.")
 
     # Retrieve and display results
@@ -250,38 +258,33 @@ def generate_consolidated_caption(captions, api_key):
 
 
 
-def integrate_human_feedback(G, feedback_path, scaling_factor=2.0):
+def integrate_ranking_feedback(G, feedback_path, top_rank_weight=1.0, decay_factor=0.9):
     """
-    Integrate human feedback into the graph.
+    Integrate ranking feedback into the graph with edges to the query.
 
     Args:
         G: NetworkX graph.
-        feedback_path: Path to the JSON file containing human feedback.
-        scaling_factor: Factor to amplify the impact of feedback on node weights.
+        feedback_path: Path to the JSON file containing human feedback rankings.
+        top_rank_weight: Initial weight for the top-ranked image.
+        decay_factor: Factor by which weights decrease for lower-ranked images.
     """
-    # Load feedback
+    # Load rankings
     with open(feedback_path, "r") as f:
         feedback = json.load(f)
+    rankings = feedback["rankings"]
 
-    # Update nodes based on feedback
-    for row in feedback:
-        img_num = row["img_num"]  # Node index
-        score = row["score"]      # Relevance score
-        
-        if img_num in G.nodes:
-            # Adjust node weight
-            G.nodes[img_num]["weight"] += score * scaling_factor
+    # Normalize rankings to start with the top-ranked node
+    for rank, node in enumerate(rankings):
+        if node in G.nodes:
+            # Assign weight based on ranking
+            rank_weight = top_rank_weight * (decay_factor ** rank)
+            G.nodes[node]["weight"] += rank_weight
 
-            # Propagate feedback to neighbors
-            for neighbor in G.neighbors(img_num):
-                edge_weight = G[img_num][neighbor]["weight"]
-                # Adjust edge weight based on feedback and similarity
-                G[img_num][neighbor]["weight"] += score * edge_weight * scaling_factor
+            # Adjust edge weight to the query
+            if G.has_edge(node, "query"):
+                G[node]["query"]["weight"] += rank_weight * decay_factor
         else:
-            print(f"Node {img_num} not found in graph. Skipping.")
-    
-    # Normalize node and edge weights
-    normalize_graph_weights(G)
+            print(f"Node {node} not found in graph. Skipping.")
 
 def calculate_average_cosine_similarity(G):
     """
@@ -297,6 +300,31 @@ def calculate_average_cosine_similarity(G):
     if not edge_weights:
         return 0.0  # Avoid division by zero if no edges
     return sum(edge_weights) / len(edge_weights)
+
+def compute_pairwise_similarity(embeddings):
+    """
+    Compute the average pairwise cosine similarity among the given embeddings.
+
+    Args:
+        embeddings: A list or array of image embeddings.
+
+    Returns:
+        average_similarity: The average pairwise cosine similarity.
+    """
+    num_embeddings = len(embeddings)
+    if num_embeddings < 2:
+        return 0.0  # No meaningful pairwise similarity if less than two embeddings
+
+    total_similarity = 0.0
+    count = 0
+
+    for i in range(num_embeddings):
+        for j in range(i + 1, num_embeddings):  # Avoid self-comparisons and duplicates
+            similarity = np.dot(embeddings[i], embeddings[j])
+            total_similarity += similarity
+            count += 1
+
+    return total_similarity / count
 
 def compute_query_similarity(original_embedding, top_k_embeddings):
     """
@@ -364,35 +392,57 @@ if __name__ == "__main__":
     original_query_embedding = original_query_embedding.cpu().numpy().astype("float32")
 
     # Perform the initial query and graph creation
-    G = query_faiss_index(query, model, processor, index, ds, k=k)
+    G = query_faiss_index_with_query_graph(query, model, processor, index, ds, k=k)
 
     # Save the initial graph
     save_graph_image(G, save_path="retrieved_images/retrieved_graph_iteration_0.png")
 
-    # Compute baseline similarity: Original k images to original query
-    original_k_indices = list(G.nodes)[:k]  # First k nodes from initial query
-    original_k_embeddings = [image_embeddings[idx] for idx in original_k_indices]
-    baseline_similarity = compute_query_similarity(original_query_embedding[0], original_k_embeddings)
+    # Compute baseline similarity: Average edge weight between "query" and top-k image nodes
+    edges_to_query = [
+        (node, G[node]["query"]["weight"])
+        for node in G.neighbors("query") if isinstance(node, (int, np.integer))
+    ]
+    edges_to_query.sort(key=lambda x: x[1], reverse=True)  # Sort by similarity
+
+    # Select top-k nodes based on edge weights
+    original_k_indices = [node for node, _ in edges_to_query[:k]]
+
+    # Compute baseline similarity to the original query
+    baseline_similarity = sum(weight for _, weight in edges_to_query[:k]) / k
     print(f"Baseline Similarity (Original k Images to Original Query): {baseline_similarity:.4f}")
 
+    # Compute baseline pairwise similarity for the 0th iteration
+    original_k_embeddings = [image_embeddings[node] for node in original_k_indices]
+    baseline_pairwise_similarity = compute_pairwise_similarity(original_k_embeddings)
+    print(f"Baseline Pairwise Cosine Similarity (0th Iteration): {baseline_pairwise_similarity:.4f}")
+
     # Log average similarities
-    avg_cos_similarities = []
-    query_to_original_similarities = []
-    
-    # 0th iteration cos sim
-    avg_similarity = calculate_average_cosine_similarity(G)
-    avg_cos_similarities.append(avg_similarity)
-    print(f"Iteration 0: Average Cosine Similarity = {avg_similarity:.4f}")
+    avg_cos_similarities = [] # cos sim of images to curr query
+    avg_pairwise_similarities = [] # cos sim of images to each other
+    query_to_original_similarities = [] # cos sim of images to orig query
+
+    # Log baseline values
+    avg_cos_similarities.append(baseline_similarity)
+    avg_pairwise_similarities.append(baseline_pairwise_similarity)
+    query_to_original_similarities.append(baseline_similarity)
+
+    print(f"Iteration 0: Average Cosine Similarity to Query = {baseline_similarity:.4f}")
+    print(f"Iteration 0: Average Pairwise Cosine Similarity = {baseline_pairwise_similarity:.4f}")
 
     # Start the requery loop
     for iteration in range(1, max_iterations + 1):
         print(f"\n--- Iteration {iteration} ---\n")
 
         # Integrate human feedback into the graph
-        integrate_human_feedback(G, feedback_path)
+        integrate_ranking_feedback(G, feedback_path)
 
-        # Find top-j closest nodes based on the updated graph
-        top_j_nodes = find_top_j_closest_nodes(G, j=j)
+        # Find top-j closest nodes based on edge weights to the query
+        edges_to_query = [
+            (node, G[node]["query"]["weight"])
+            for node in G.neighbors("query") if isinstance(node, (int, np.integer))
+        ]
+        edges_to_query.sort(key=lambda x: x[1], reverse=True)
+        top_j_nodes = [node for node, _ in edges_to_query[:j]]
         top_j_captions = [ds[int(node)]["caption"][0] for node in top_j_nodes]
         print(f"Top-{j} captions for iteration {iteration}: {top_j_captions}")
 
@@ -401,24 +451,43 @@ if __name__ == "__main__":
         print(f"Consolidated Caption for iteration {iteration}: {new_caption}")
 
         # Perform a re-query with the new caption
-        G = query_faiss_index(new_caption, model, processor, index, ds, k=k)
+        G = query_faiss_index_with_query_graph(new_caption, model, processor, index, ds, k=k)
 
         # Save the updated graph
         save_graph_image(G, save_path=f"retrieved_images/retrieved_graph_iteration_{iteration}_new_query.png")
 
-        # Calculate average cosine similarity of the updated graph
-        avg_similarity = calculate_average_cosine_similarity(G)
-        avg_cos_similarities.append(avg_similarity)
-        print(f"Iteration {iteration}: Average Cosine Similarity in Graph = {avg_similarity:.4f}")
+        # Calculate average cosine similarity of the updated graph (to the new query)
+        edges_to_query = [
+            (node, G[node]["query"]["weight"])
+            for node in G.neighbors("query") if isinstance(node, (int, np.integer))
+        ]
+        edges_to_query.sort(key=lambda x: x[1], reverse=True)  # Sort by similarity
+        avg_query_similarity = sum(weight for _, weight in edges_to_query[:k]) / k
+        avg_cos_similarities.append(avg_query_similarity)
+        print(f"Iteration {iteration}: Average Cosine Similarity to New Query = {avg_query_similarity:.4f}")
 
-        # Compute similarity between the original query and re-queried nodes
-        top_k_indices = list(G.nodes)[:k]  # First k nodes from updated graph
-        top_k_embeddings = [image_embeddings[idx] for idx in top_k_indices]
-        query_similarity = compute_query_similarity(original_query_embedding[0], top_k_embeddings)
-        query_to_original_similarities.append(query_similarity)
-        print(f"Iteration {iteration}: Similarity to Original Query = {query_similarity:.4f}")
+        # Compute pairwise cosine similarity among top-k image embeddings
+        top_k_embeddings = [image_embeddings[node] for node, _ in edges_to_query[:k]]
+        avg_pairwise_similarity = compute_pairwise_similarity(top_k_embeddings)
+        avg_pairwise_similarities.append(avg_pairwise_similarity)
+        print(f"Iteration {iteration}: Average Pairwise Cosine Similarity = {avg_pairwise_similarity:.4f}")
+
+        # Compute similarity between the original query and re-queried nodes (top-k nodes)
+        similarity_to_original_query = compute_query_similarity(original_query_embedding[0], top_k_embeddings)
+        query_to_original_similarities.append(similarity_to_original_query)
+        print(f"Iteration {iteration}: Average Cosine Similarity to Original Query = {similarity_to_original_query:.4f}")
 
     # Log all results
+    print(avg_cos_similarities)
+    print(avg_pairwise_similarities)
+    print(query_to_original_similarities)
     print("\n--- Summary of Cosine Similarities ---")
-    for i, (avg_sim, query_sim) in enumerate(zip(avg_cos_similarities, query_to_original_similarities), 1):
-        print(f"Iteration {i}: Avg Cosine Similarity = {avg_sim:.4f}, Query Similarity = {query_sim:.4f}")
+    for i, (avg_sim, pairwise_sim, query_sim) in enumerate(
+        zip(avg_cos_similarities, avg_pairwise_similarities, query_to_original_similarities)
+    ):
+        print(
+            f"Iteration {i}: Avg Cosine Similarity to Query = {avg_sim:.4f}, "
+            f"Pairwise Cosine Similarity = {pairwise_sim:.4f}, "
+            f"Query Similarity to Original = {query_sim:.4f}"
+        )
+
